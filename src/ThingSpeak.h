@@ -85,6 +85,7 @@
 #define THINGSPEAK_URL "api.thingspeak.com"
 #define THINGSPEAK_IPADDRESS IPAddress(184,106,153,149)
 #define THINGSPEAK_PORT_NUMBER 80
+#define MAXARRAY_NUMBER (65)
 
 #ifdef ARDUINO_ARCH_AVR
     #ifdef ARDUINO_AVR_YUN
@@ -116,6 +117,8 @@
 #define ERR_BAD_RESPONSE        -303    // Unable to parse response
 #define ERR_TIMEOUT             -304    // Timeout waiting for server to respond
 #define ERR_NOT_INSERTED        -401    // Point was not inserted (most probable cause is the rate limit of once every 15 seconds)
+
+#define Burst_Write_Support
 
 /**
  * @brief This library enables an Arduino or other compatible hardware to write or read data to or from ThingSpeak, an open data platform for the Internet of Things with MATLAB analytics and visualization. 
@@ -581,6 +584,165 @@ class ThingSpeakClass
 		return OK_SUCCESS;
 	};
 
+#ifdef Burst_Write_Support	       
+	int setBurstField(unsigned int field, int array_index, int value)
+	{
+#ifdef SPARK
+        // On Spark, int and long are the same, so map to the long version
+        return setBurstField(field, array_index, (long)value);
+#else
+		char valueString[10];  // int range is -32768 to 32768, so 7 bytes including terminator
+	    itoa(value, valueString, 10);
+		
+		return setBurstField(field, array_index, valueString);
+#endif
+	};
+
+	
+	int setBurstField(unsigned int field, int array_index, long value)
+	{
+		char valueString[15];  // long range is -2147483648 to 2147483647, so 12 bytes including terminator
+	    ltoa(value, valueString, 10);
+		return setBurstField(field, array_index, valueString);
+	};
+
+
+	
+    int setBurstField(unsigned int field, int array_index, float value)
+	{
+		char valueString[20]; // range is -999999000000.00000 to 999999000000.00000, so 19 + 1 for the terminator
+		int status = convertFloatToChar(value, valueString);
+		if(status != OK_SUCCESS) return status;
+
+		return setBurstField(field, array_index, valueString);
+	};
+
+	
+    int setBurstField(unsigned int field, int array_index, const char *value)
+	{
+		return setBurstField(field,  array_index, String(value));
+	};
+
+	
+    int setBurstField(unsigned int field, int array_index, String value)
+	{
+		#ifdef PRINT_DEBUG_MESSAGES
+		  #ifdef SPARK
+            Spark.publish(SPARK_PUBLISH_TOPIC, "setField " + String(field) + " to " + String(value), SPARK_PUBLISH_TTL, PRIVATE);
+          #else
+			Serial.print("ts::setField   (field: "); Serial.print(field); Serial.print(" value: \""); Serial.print(value); Serial.println("\")");
+		  #endif
+		#endif
+		if(field < FIELDNUM_MIN || field > FIELDNUM_MAX) return ERR_INVALID_FIELD_NUM;
+		if(array_index > MAXARRAY_NUMBER) return ERR_INVALID_FIELD_NUM;
+		// Max # bytes for ThingSpeak field is 255 (UTF-8)
+		if(value.length() > FIELDLENGTH_MAX) return ERR_OUT_OF_RANGE;
+		this->nextBurstWriteField[field - 1][array_index] = value;
+		return OK_SUCCESS;
+	};
+
+    int setTimeStampField(int index, String value)
+	{
+		// Max # bytes for ThingSpeak field is 255 (UTF-8)
+		if(value.length() > FIELDLENGTH_MAX) return ERR_OUT_OF_RANGE;
+		this->timeStamp[index] = value;
+		return OK_SUCCESS;
+	};
+	
+	int writeBurstFields(unsigned long channelNumber, int array_number, const char * writeAPIKey)
+	{
+		String postMessage = String("");
+		bool fFirstItem = true, fieldchange=false, timestamppatch = false;
+		int i;
+		
+		for(size_t iField = 0; iField < 8; iField++)
+		{
+                   for ( i = 0; i < array_number; i++)
+                   {		    
+			if(this->nextBurstWriteField[iField][i].length() > 0)
+			{
+				if(!fFirstItem)
+				{
+					postMessage = postMessage + String("&");
+				}
+				if(!fieldchange)
+				{					
+				        postMessage = postMessage + String("field") + String(iField + 1) + String("=") + this->nextBurstWriteField[iField][i];
+					 fieldchange = true;
+				}
+				else
+				{
+       				        postMessage = postMessage + String(",") + this->nextBurstWriteField[iField][i];
+				}
+				
+				this->nextBurstWriteField[iField][i] = "";
+			}
+                   }
+		    fFirstItem = false;
+		    fieldchange = false;
+		}
+
+		for ( i = 0; i < array_number; i++)
+               {		    
+			if(this->timeStamp[i].length() > 0)
+			{
+				if(!timestamppatch)
+				{
+					postMessage = postMessage + String("&created_at=") + this->timeStamp[i];
+					timestamppatch = true;
+				}
+				else{
+				
+	       				postMessage = postMessage + String(",") + this->timeStamp[i];
+				}	
+				
+				this->timeStamp[i] = "";
+			}
+               }		
+
+		if(!isnan(nextWriteLatitude))
+		{
+			if(!fFirstItem)
+			{
+				postMessage = postMessage + String("&");
+			}
+			postMessage = postMessage + String("lat=") + String(this->nextWriteLatitude);
+			fFirstItem = false;
+			this->nextWriteLatitude = NAN;
+		}
+
+		if(!isnan(this->nextWriteLongitude))
+		{
+			if(!fFirstItem)
+			{
+				postMessage = postMessage + String("&");
+			}
+			postMessage = postMessage + String("long=") + String(this->nextWriteLongitude);
+			fFirstItem = false;
+			this->nextWriteLongitude = NAN;
+		}
+
+
+		if(!isnan(this->nextWriteElevation))
+		{
+			if(!fFirstItem)
+			{
+				postMessage = postMessage + String("&");
+			}
+			postMessage = postMessage + String("elevation=") + String(this->nextWriteElevation);
+			fFirstItem = false;
+			this->nextWriteElevation = NAN;
+		}
+
+		if(fFirstItem)
+		{
+			// setField was not called before writeFields
+			return ERR_SETFIELD_NOT_CALLED;
+		}
+
+		return writeRaw(channelNumber, postMessage, writeAPIKey);
+	};	
+#endif
 
 	/**
 	 * @brief Set the latitude of a multi-field update.
@@ -1273,6 +1435,8 @@ private:
 	IPAddress customIP = INADDR_NONE;
     unsigned int port = THINGSPEAK_PORT_NUMBER;
 	String nextWriteField[8];
+	String nextBurstWriteField[8][MAXARRAY_NUMBER];
+	String timeStamp[MAXARRAY_NUMBER];
 	float nextWriteLatitude;
 	float nextWriteLongitude;
 	float nextWriteElevation;
